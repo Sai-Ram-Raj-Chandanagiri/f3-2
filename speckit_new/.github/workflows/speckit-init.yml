@@ -1,0 +1,199 @@
+---
+name: Spec Kit initialization
+on:
+  workflow_call:
+    inputs:
+      ai-assistants:
+        required: false
+        type: string
+        description: AI assistants to use (comma-separated)
+        default: claude,codex,gemini,copilot
+      script-type:
+        required: false
+        type: string
+        description: Script type to use
+        default: sh
+      uv-version:
+        required: false
+        type: string
+        description: Version of uv to use
+        default: latest
+      prettify-md-and-json:
+        required: false
+        type: boolean
+        description: Whether to prettify Markdown and JSON files after initialization
+        default: true
+      disable-shellcheck:
+        required: false
+        type: boolean
+        description: Whether to disable shellcheck in Spec Kit shell scripts
+        default: true
+      git-add-args:
+        required: false
+        type: string
+        description: Paths to add to the generated-output pull request
+        default: .
+      version-md-file-to-write:
+        required: false
+        type: string
+        description: Path to a Markdown file to write the `specify --version` output to
+        default: null
+    secrets:
+      GH_TOKEN:
+        required: false
+        description: GitHub token
+permissions:
+  contents: write
+  pull-requests: write
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+    working-directory: .
+jobs:
+  speckit-init:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 1
+          persist-credentials: true
+      - name: Set up uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          version: ${{ inputs.uv-version }}
+      - name: Identify the latest version of Spec Kit
+        id: speckit-version
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+        run: |
+          SPECKIT_VERSION="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/github/spec-kit/releases/latest | jq -er .tag_name)"
+          [[ "${SPECKIT_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected Spec Kit release tag: ${SPECKIT_VERSION}" >&2; exit 1; }
+          printf 'SPECKIT_VERSION=%s\n' "${SPECKIT_VERSION}" >> "${GITHUB_OUTPUT}"
+      - name: Install Specify CLI
+        env:
+          SPECKIT_VERSION: ${{ steps.speckit-version.outputs.SPECKIT_VERSION }}
+        run: >
+          uv tool install specify-cli --from "git+https://github.com/github/spec-kit.git@${SPECKIT_VERSION}"
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: latest
+      - name: Display Specify CLI version
+        if: inputs.version-md-file-to-write == null
+        run: >
+          specify --version
+      - name: Save Specify CLI version to a Markdown file
+        if: inputs.version-md-file-to-write != null
+        env:
+          VERSION_MD_FILE: ${{ inputs.version-md-file-to-write }}
+        run: |
+          printf '%s\n' '# Spec Kit Version' '' '```text' "$(specify --version)" '```' | tee "${VERSION_MD_FILE}"
+      - name: Check whether Spec Kit version changed
+        id: version-changed
+        if: inputs.version-md-file-to-write != null
+        env:
+          VERSION_MD_FILE: ${{ inputs.version-md-file-to-write }}
+        run: |
+          if [[ -n "$(git status --porcelain -- "${VERSION_MD_FILE}")" ]]; then
+            echo 'changed=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'changed=false' >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Initialize Spec Kit
+        if: >
+          inputs.version-md-file-to-write == null
+          || steps.version-changed.outputs.changed == 'true'
+        env:
+          AI_ASSISTANTS: ${{ inputs.ai-assistants }}
+          SCRIPT_TYPE: ${{ inputs.script-type }}
+        run: >
+          tr ',' '\n' <<< "${AI_ASSISTANTS}"
+          | xargs -L1 -t specify init --force --here --ignore-agent-tools --script "${SCRIPT_TYPE}" --integration
+      - name: Prettify output files
+        if: >
+          inputs.prettify-md-and-json
+          && (inputs.version-md-file-to-write == null
+          || steps.version-changed.outputs.changed == 'true')
+        run: >
+          npx prettier --write './**/*.{md,json}'
+      - name: Normalize Markdown output
+        if: >
+          inputs.version-md-file-to-write == null
+          || steps.version-changed.outputs.changed == 'true'
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          paths = subprocess.check_output(
+              ["git", "ls-files", "-z", "--", "*.md", "*.markdown"]
+          ).decode().split("\0")
+          for name in filter(None, paths):
+              path = Path(name)
+              if path.is_symlink():
+                  continue
+              lines = path.read_text().splitlines()
+              in_fence = False
+              for i, line in enumerate(lines):
+                  bare = re.fullmatch(r"(\s*)```\s*", line)
+                  if bare:
+                      if in_fence:
+                          in_fence = False
+                      else:
+                          lines[i] = f"{bare.group(1)}```text"
+                          in_fence = True
+                      continue
+                  if re.match(r"^\s*```\S", line):
+                      in_fence = True
+              if not any("markdownlint-disable MD058" in line for line in lines):
+                  for start, line in enumerate(lines):
+                      if "| Option | Description" not in line:
+                          continue
+                      indent = line[: len(line) - len(line.lstrip())]
+                      end = start
+                      while end + 1 < len(lines) and lines[end + 1].lstrip().startswith("|"):
+                          end += 1
+                      lines.insert(start, f"{indent}<!-- markdownlint-disable MD058 -->")
+                      lines.insert(end + 2, f"{indent}<!-- markdownlint-enable MD058 -->")
+                      break
+              path.write_text("\n".join(lines) + "\n")
+          PY
+          config_file="${RUNNER_TEMP}/markdownlint-cli2.jsonc"
+          printf '{"config":{"MD013":false,"MD033":false,"MD041":false}}' > "${config_file}"
+          set +e
+          git ls-files -z -- '*.md' '*.markdown' \
+            | xargs -0 -r npx -y markdownlint-cli2 --fix --config "${config_file}" --
+          set -e
+          npx prettier --write './**/*.{md,json}'
+          git ls-files -z -- '*.md' '*.markdown' \
+            | xargs -0 -r npx -y markdownlint-cli2 --config "${config_file}" --
+      - name: Disable shellcheck in Spec Kit shell scripts
+        if: >
+          inputs.script-type == 'sh'
+          && inputs.disable-shellcheck
+          && (inputs.version-md-file-to-write == null
+          || steps.version-changed.outputs.changed == 'true')
+        working-directory: .specify
+        run: |
+          while IFS= read -r f; do
+            grep -qF '# shellcheck disable=all' "$f" || sed -ie '2i# shellcheck disable=all' "$f"
+          done < <(find . -type f -name '*.sh')
+          find . -type f -name '*.she' -delete
+      - name: Create or update a pull request for generated changes
+        if: >
+          github.event_name != 'pull_request'
+          && (inputs.version-md-file-to-write == null
+          || steps.version-changed.outputs.changed == 'true')
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
+        with:
+          token: ${{ secrets.GH_TOKEN || github.token }}
+          add-paths: ${{ inputs.git-add-args }}
+          commit-message: Update Spec Kit output files
+          branch: automation/speckit-output
+          delete-branch: true
+          title: Update generated Spec Kit output
+          body: Update the checked-in Spec Kit files to match the latest release.
+          base: ${{ github.event.repository.default_branch }}
